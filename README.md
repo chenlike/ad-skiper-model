@@ -5,3 +5,8 @@
 
 # WIP🚧
 > 施工中
+
+
+```bash
+python3 .\att_infer.py --model_path .\att_best_model_epoch1_9530.pth --min_ad_duration 5 --merge_gap_duration 60  --audio_path .\audio_test\BV1NMTMzvEkP.mp3
+```
