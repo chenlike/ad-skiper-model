@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
 import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
 
 # ----------------------------
 # 设置随机种子以保证可复现
@@ -28,21 +29,19 @@ set_seed()
 # ----------------------------
 class ContextualAdDataset(Dataset):
     def __init__(self,
-                 json_path: str,
+                 file_items: list,  # 改为直接传入文件项列表
                  audio_dir: str,
                  sequence_length: int = 8,
                  segment_duration: float = 3.0,
                  sample_rate: int = 16000,
-                 ad_ratio_threshold: float = 0.5,
-                 max_files: int = -1):
+                 ad_ratio_threshold: float = 0.5):
         """
-        json_path: 标注 JSON 文件路径
+        file_items: 标注JSON文件中的项列表
         audio_dir: 音频文件所在目录
         sequence_length: 每个样本包含的连续片段数量 (用于Transformer上下文)
         segment_duration: 每个片段的时长（秒）
         sample_rate: 目标采样率
         ad_ratio_threshold: 广告占比超过此阈值则标记为广告 (1), 否则为非广告 (0)
-        max_files: 若 >0, 则只加载前 max_files 个音频文件, 用于快速测试
         """
         self.sequence_length = sequence_length
         self.segment_duration = segment_duration
@@ -50,17 +49,11 @@ class ContextualAdDataset(Dataset):
         self.seg_len_samples = int(segment_duration * sample_rate)
         self.ad_ratio_threshold = ad_ratio_threshold
         self.sequences = []
+        self.audio_dir = audio_dir
 
-        # 1. 按音频文件分组处理
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-        
-        files_to_process = data
-        if max_files > 0:
-            files_to_process = data[:max_files]
-
-        for item in tqdm(files_to_process, desc="加载并切分数据", unit="文件"):
-            audio_path = os.path.join(audio_dir, item['audioPath'])
+        # 按音频文件分组处理
+        for item in tqdm(file_items, desc="加载并切分数据", unit="文件"):
+            audio_path = os.path.join(self.audio_dir, item['audioPath'])
             if not os.path.exists(audio_path):
                 continue
 
@@ -79,7 +72,7 @@ class ContextualAdDataset(Dataset):
             
             ad_intervals = sorted([(ad['startTime'], ad['endTime']) for ad in item.get('ads', [])], key=lambda x: x[0])
 
-            # 2. 生成该文件的所有连续片段及其标签
+            # 生成该文件的所有连续片段及其标签
             file_segments = []
             step_samples = self.seg_len_samples // 2  # 50% 重叠
             for start_sample in range(0, total_duration_samples - self.seg_len_samples + 1, step_samples):
@@ -102,7 +95,7 @@ class ContextualAdDataset(Dataset):
                 
                 file_segments.append({'waveform': segment_waveform, 'label': torch.tensor(label, dtype=torch.float32)})
             
-            # 3. 从该文件的片段列表中构建序列
+            # 从该文件的片段列表中构建序列
             if len(file_segments) >= self.sequence_length:
                 for i in range(len(file_segments) - self.sequence_length + 1):
                     self.sequences.append(file_segments[i:i + self.sequence_length])
@@ -119,7 +112,7 @@ class ContextualAdDataset(Dataset):
         return waveforms, labels
 
 # ----------------------------
-# 上下文感知广告分类模型 (修正后)
+# 上下文感知广告分类模型
 # ----------------------------
 class ContextualAdClassifier(nn.Module):
     def __init__(self, backbone, freeze_backbone=True, d_model=768, nhead=8, num_layers=3):
@@ -164,15 +157,8 @@ class ContextualAdClassifier(nn.Module):
         
         # 2. 使用 dasheng 提取每个片段的时序特征
         with torch.set_grad_enabled(not self.freeze_backbone):
-            # ----------- 【错误的代码 - 已注释】 -----------
-            # segment_embeddings = self.backbone.forward_cls_token(x) # -> [B*S, D]
-            
-            # ----------- 【修正后的代码】 -----------
-            # self.backbone(x) 返回时序特征 [B*S, TimeSteps, Dim]
             sequence_features = self.backbone(x) 
-            # 通过在时间维度上进行平均池化, 得到每个片段的单一特征向量
             segment_embeddings = sequence_features.mean(dim=1) # -> [B*S, Dim]
-            # ----------------------------------------
 
         # 3. 恢复序列维度
         segment_embeddings = segment_embeddings.view(B, S, -1) # -> [B, S, D]
@@ -187,8 +173,9 @@ class ContextualAdClassifier(nn.Module):
         probs = torch.sigmoid(logits)
         
         return probs
+
 # ----------------------------
-# 训练与验证函数 (更新后)
+# 训练与验证函数
 # ----------------------------
 def train_one_epoch(model: nn.Module,
                     dataloader: DataLoader,
@@ -200,20 +187,17 @@ def train_one_epoch(model: nn.Module,
     
     bar = tqdm(dataloader, desc="🚀 Training", leave=False)
     for waveforms, labels in bar:
-        # waveforms: [B, S, 1, L], labels: [B, S]
         waveforms = waveforms.to(device)
         labels = labels.to(device)
         
         optimizer.zero_grad()
         
-        # 获得模型输出的概率 [B, S]
         predictions = model(waveforms)
         
-        # 将预测和标签展平, 以便计算损失
         loss = criterion(predictions.view(-1), labels.view(-1))
         
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # 梯度裁剪
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
         total_loss += loss.item()
@@ -242,18 +226,14 @@ def evaluate(model: nn.Module,
             loss = criterion(predictions.view(-1), labels.view(-1))
             total_loss += loss.item()
             
-            # 收集预测和标签用于计算指标
-            # 将概率转换为二进制预测 (0或1)
             binary_preds = (predictions > 0.5).float()
             
             all_preds.append(binary_preds.view(-1).cpu())
             all_labels.append(labels.view(-1).cpu())
 
-    # 合并所有批次的结果
     all_preds = torch.cat(all_preds).numpy()
     all_labels = torch.cat(all_labels).numpy()
     
-    # 计算分类指标
     metrics = {
         "loss": total_loss / len(dataloader),
         "accuracy": accuracy_score(all_labels, all_preds),
@@ -265,21 +245,25 @@ def evaluate(model: nn.Module,
     return metrics
 
 # ----------------------------
-# 主函数 (更新后)
+# 主函数 (完整修改)
 # ----------------------------
 def main():
     parser = argparse.ArgumentParser(description="上下文感知广告检测模型训练脚本")
     parser.add_argument('--json_path', type=str, default='./audio_ads.json', help='标注 JSON 文件路径')
     parser.add_argument('--audio_dir', type=str, default='./audio/', help='音频目录')
-    parser.add_argument('--batch_size', type=int, default=16, help='批量大小 (序列较长, 建议减小)')
+    parser.add_argument('--batch_size', type=int, default=64, help='批量大小')
     parser.add_argument('--num_epochs', type=int, default=25, help='训练轮数')
     parser.add_argument('--learning_rate', type=float, default=5e-5, help='学习率')
     parser.add_argument('--val_split', type=float, default=0.15, help='验证集比例')
     parser.add_argument('--freeze_dasheng', action='store_true', help='是否冻结 dasheng 骨干')
-    parser.add_argument('--max_files', type=int, default=50, help='最大音频文件数, 用于快速测试 (-1 表示所有文件)')
+    parser.add_argument('--max_files', type=int, default=-1, help='最大音频文件数 (-1 表示所有文件)')
     parser.add_argument('--segment_duration', type=float, default=3.0, help='每个片段的时长（秒）')
-    parser.add_argument('--sequence_length', type=int, default=8, help='Transformer的上下文窗口大小 (片段数量)')
+    parser.add_argument('--sequence_length', type=int, default=8, help='上下文窗口大小 (片段数量)')
     parser.add_argument('--output_dir', type=str, default='./output_contextual', help='模型输出目录')
+    
+    # 新增断点恢复参数
+    parser.add_argument('--resume', type=str, default=None, help='恢复训练检查点路径')
+    parser.add_argument('--resume_epoch', type=int, default=0, help='恢复训练的起始epoch')
     
     args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -287,22 +271,40 @@ def main():
     
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 1. 加载数据集
-    print("📂 加载并构建序列数据集...")
-    full_dataset = ContextualAdDataset(
-        json_path=args.json_path,
+    # 1. 加载并分割数据集（按音频文件级别）
+    print("📂 加载数据集元信息并划分训练/验证集...")
+    with open(args.json_path, 'r') as f:
+        all_items = json.load(f)
+    
+    # 如果限制了最大文件数
+    if args.max_files > 0:
+        all_items = all_items[:args.max_files]
+    
+    # 按文件划分训练集和验证集
+    train_items, val_items = train_test_split(
+        all_items, 
+        test_size=args.val_split, 
+        random_state=42  # 固定随机种子保证可复现
+    )
+    
+    print(f"✅ 数据集划分完成 - 总文件: {len(all_items)} | 训练文件: {len(train_items)} | 验证文件: {len(val_items)}")
+    
+    # 2. 创建训练集和验证集数据集
+    print("🛠️ 构建训练数据集...")
+    train_dataset = ContextualAdDataset(
+        file_items=train_items,
         audio_dir=args.audio_dir,
         sequence_length=args.sequence_length,
-        segment_duration=args.segment_duration,
-        max_files=args.max_files
+        segment_duration=args.segment_duration
     )
-    print(f"✅ 数据集加载完成 - 总序列数: {len(full_dataset)}")
-
-    # 2. 划分训练/验证集
-    dataset_size = len(full_dataset)
-    val_size = int(np.floor(args.val_split * dataset_size))
-    train_size = dataset_size - val_size
-    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+    
+    print("🛠️ 构建验证数据集...")
+    val_dataset = ContextualAdDataset(
+        file_items=val_items,
+        audio_dir=args.audio_dir,
+        sequence_length=args.sequence_length,
+        segment_duration=args.segment_duration
+    )
     
     print(f"   训练集序列数: {len(train_dataset)} | 验证集序列数: {len(val_dataset)}")
 
@@ -312,20 +314,42 @@ def main():
 
     # 4. 初始化模型、损失和优化器
     print("🛠️ 初始化上下文感知模型...")
-    backbone = dasheng.dasheng_base() # 使用 base 版本以平衡性能和效率
+    backbone = dasheng.dasheng_base()
     model = ContextualAdClassifier(
         backbone=backbone,
         freeze_backbone=args.freeze_dasheng
     ).to(device)
     
-    criterion = nn.BCELoss() # 二分类交叉熵
+    criterion = nn.BCELoss()
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', factor=0.5, patience=2, verbose=True)
-
-    # 5. 训练循环
+    
+    start_epoch = 0
     best_f1 = 0.0
-    for epoch in range(args.num_epochs):
-        print(f"\n======== Epoch {epoch+1}/{args.num_epochs} ========")
+    
+    # 5. 恢复训练检查点（如果提供了）
+    if args.resume and os.path.exists(args.resume):
+        print(f"🔄 从检查点恢复训练: {args.resume}")
+        
+        # 加载完整检查点
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # 恢复训练状态
+        start_epoch = checkpoint['epoch'] + 1
+        best_f1 = checkpoint['best_f1']
+        
+        # 使用命令行参数覆盖检查点中的epoch设置
+        if args.resume_epoch > 0:
+            start_epoch = args.resume_epoch
+        
+        print(f"   恢复训练状态 - 起始Epoch: {start_epoch}, 最佳F1: {best_f1:.4f}")
+
+    # 6. 训练循环 (支持断点恢复)
+    for epoch in range(start_epoch, args.num_epochs):
+        print(f"\n======== Epoch {epoch+1}/{args.num_epochs} ({(epoch+1)/args.num_epochs*100:.1f}%) ========")
         
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_metrics = evaluate(model, val_loader, criterion, device)
@@ -342,13 +366,34 @@ def main():
         
         scheduler.step(current_f1)
         
+        # 7. 创建检查点信息
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_f1': best_f1,
+            'current_f1': current_f1
+        }
+        
+        # 8. 保存最新检查点
+        latest_checkpoint = os.path.join(args.output_dir, 'checkpoint_latest.pth')
+        torch.save(checkpoint, latest_checkpoint)
+        print(f"\n💾 保存最新检查点到: {latest_checkpoint}")
+        
+        # 9. 保存最佳模型检查点
         if current_f1 > best_f1:
             best_f1 = current_f1
-            best_model_path = os.path.join(args.output_dir, 'best_model.pth')
-            torch.save(model.state_dict(), best_model_path)
-            print(f"\n💾 新的最佳 F1 分数！模型已保存至: {best_model_path}")
+            best_checkpoint = os.path.join(args.output_dir, 'checkpoint_best.pth')
+            torch.save(checkpoint, best_checkpoint)
+            
+            # 单独保存模型用于部署
+            model_save_path = os.path.join(args.output_dir, 'best_model.pth')
+            torch.save(model.state_dict(), model_save_path)
+            
+            print(f"\n🏆 新的最佳 F1 分数！模型已保存至: {best_checkpoint}")
 
-    print(f"\n🎉 训练完成! 最佳 F1 分数为: {best_f1:.4f}")
+    print(f"\n🎉 训练完成! 最终最佳 F1 分数为: {best_f1:.4f}")
 
 if __name__ == '__main__':
     main()

@@ -189,10 +189,24 @@ def run_inference(args):
         print("检测到的最终广告时间戳:")
         for ad in ad_timestamps:
             duration = ad['endTime'] - ad['startTime']
-            print(f"  - 开始: {ad['startTime']:.2f}s, 结束: {ad['endTime']:.2f}s (时长: {duration:.2f}s)")
+            print(f"  - 开始: {format_time(ad['startTime'])}, "
+                  f"结束: {format_time(ad['endTime'])} "
+                  f"(时长: {format_time(duration)})")
     else:
         print("未检测到满足条件的广告。")
 
+def format_time(seconds):
+    """将秒数转换为 'MM:SS.xx (seconds)' 格式的字符串
+    
+    Args:
+        seconds (float): 需要转换的秒数
+    
+    Returns:
+        str: 格式化后的时间字符串
+    """
+    minutes = int(seconds) // 60
+    secs = seconds % 60
+    return f"{minutes:02d}:{secs:05.2f} ({seconds:.2f}s)"
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
