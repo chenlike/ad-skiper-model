@@ -11,7 +11,7 @@ function convertSecondsToTime(seconds) {
 
 async function main() {
     // 读取 audio 目录下的所有 MP3 文件
-    const audioDir = './audio';
+    const audioDir = './audio_test';
     const files = fs.readdirSync(audioDir);
     const mp3Files = files.filter(file => file.endsWith('.mp3'));
 
@@ -29,7 +29,7 @@ async function main() {
 
         let video = {
             videoID,
-            audioPath: `./audio/${videoID}.mp3`,
+            audioPath: `./audio_test/${videoID}.mp3`,
             ads: []
         }
         // 处理每条记录
@@ -52,7 +52,7 @@ async function main() {
     }
 
     // 将结果写入 JSON 文件
-    fs.writeFileSync('audio_ads.json', JSON.stringify(arr, null, 2));
+    fs.writeFileSync('audio_ads_test.json', JSON.stringify(arr, null, 2));
     console.log(`处理完成，共找到 ${arr.length} 条记录`);
 }
 

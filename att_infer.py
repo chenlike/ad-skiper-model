@@ -64,7 +64,7 @@ def run_inference(args):
     # 1. 模型加载 (与之前相同)
     print("🛠️  加载模型...")
     backbone = dasheng.dasheng_base()
-    model = ContextualAdClassifier(backbone=backbone, freeze_backbone=True, num_layers=3, nhead=8).to(device)
+    model = ContextualAdClassifier(backbone=backbone, freeze_backbone=False, num_layers=3, nhead=8).to(device)
     model.load_state_dict(torch.load(args.model_path, map_location=device))
     model.eval()
     print(f"✅ 模型加载成功: {args.model_path}")
@@ -135,6 +135,17 @@ def run_inference(args):
     segment_counts[segment_counts == 0] = 1
     final_segment_probs = segment_predictions / segment_counts
 
+    # 输出每个片段的时间和概率
+    print("📊 片段检测结果详情:")
+    print(f"{'序号':<4} {'开始时间':<12} {'结束时间':<12} {'概率':<8} {'判断'}")
+    print("-" * 50)
+    for i, prob in enumerate(final_segment_probs):
+        segment_start_sec = (i * step_samples) / args.sample_rate
+        segment_end_sec = segment_start_sec + args.segment_duration
+        is_ad = "广告" if prob > args.threshold else "非广告"
+        print(f"{i+1:<4} {format_time(segment_start_sec):<12} {format_time(segment_end_sec):<12} {prob:8.4f} {is_ad}")
+    print("-" * 50)
+
     # 7. 后处理
     print("📈 后处理结果...")
     final_segment_labels = (final_segment_probs > args.threshold).astype(int)
@@ -180,7 +191,22 @@ def run_inference(args):
         print(f"   - 合并前: {original_count} 条, 合并后: {len(ad_timestamps)} 条")
 
     # 8. 保存结果
-    output_data = {"audioPath": os.path.basename(args.audio_path), "detectedAds": ad_timestamps}
+    segment_results = []
+    for i, prob in enumerate(final_segment_probs):
+        segment_start_sec = (i * step_samples) / args.sample_rate
+        segment_end_sec = segment_start_sec + args.segment_duration
+        segment_results.append({
+            "startTime": round(segment_start_sec, 2),
+            "endTime": round(segment_end_sec, 2),
+            "probability": round(float(prob), 4),
+            "isAd": bool(prob > args.threshold)
+        })
+
+    output_data = {
+        "audioPath": os.path.basename(args.audio_path),
+        "detectedAds": ad_timestamps,
+        "segmentResults": segment_results
+    }
     with open(args.output_json, 'w', encoding='utf-8') as f:
         json.dump(output_data, f, indent=4, ensure_ascii=False)
         
